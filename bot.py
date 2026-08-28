@@ -3,7 +3,7 @@ import asyncio
 import logging
 
 import discord
-from discord.ext import commands
+from discord import app_commands
 import wavelink
 
 logging.basicConfig(level=logging.INFO)
@@ -15,15 +15,15 @@ LAVALINK_HOST = os.environ.get("LAVALINK_HOST", "lavalinkv4.serenetia.com")
 LAVALINK_PORT = int(os.environ.get("LAVALINK_PORT", "443"))
 LAVALINK_PASSWORD = os.environ.get("LAVALINK_PASSWORD", "https://dsc.gg/ajidevserver")
 LAVALINK_SECURE = os.environ.get("LAVALINK_SECURE", "true").lower() == "true"
-COMMAND_PREFIX = os.environ.get("COMMAND_PREFIX", "!")
 
 
-class MusicBot(commands.Bot):
+class MusicBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.voice_states = True
-        super().__init__(command_prefix=COMMAND_PREFIX, intents=intents)
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
         scheme = "https" if LAVALINK_SECURE else "http"
@@ -32,6 +32,9 @@ class MusicBot(commands.Bot):
             password=LAVALINK_PASSWORD,
         )
         await wavelink.Pool.connect(nodes=[node], client=self)
+        # Đồng bộ slash commands (chỉ cần chạy 1 lần, sau đó có thể comment dòng này)
+        await self.tree.sync()
+        log.info("Đã đồng bộ slash commands với Discord.")
 
 
 bot = MusicBot()
@@ -61,7 +64,7 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before, after):
-    # Tự rời voice channel nếu bot ở một mình
+    # Tự rồi voice channel nếu bot ở một mình
     if member.bot:
         return
     vc = member.guild.voice_client
@@ -77,30 +80,33 @@ async def on_ready():
     log.info(f"Đăng nhập với tên {bot.user} (ID: {bot.user.id})")
 
 
-# ====================== LỆNH NHẠC ======================
+# ====================== HÀM HỖ TRỢ ======================
 
-async def _ensure_voice(ctx: commands.Context) -> wavelink.Player | None:
-    if not ctx.author.voice or not ctx.author.voice.channel:
-        await ctx.send("❌ Bạn cần vào một voice channel trước.")
+async def _ensure_voice(interaction: discord.Interaction) -> wavelink.Player | None:
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.response.send_message("❌ Bạn cần vào một voice channel trước.", ephemeral=True)
         return None
 
-    player: wavelink.Player = ctx.voice_client  # type: ignore
+    player: wavelink.Player = interaction.guild.voice_client  # type: ignore
     if not player:
         try:
-            player = await ctx.author.voice.channel.connect(cls=wavelink.Player)
+            player = await interaction.user.voice.channel.connect(cls=wavelink.Player)
         except discord.ClientException:
-            await ctx.send("❌ Không thể kết nối vào voice channel.")
+            await interaction.response.send_message("❌ Không thể kết nối vào voice channel.", ephemeral=True)
             return None
-        player.home = ctx.channel  # type: ignore
+        player.home = interaction.channel  # type: ignore
         player.autoplay = wavelink.AutoPlayMode.partial
 
     return player
 
 
-@bot.command(name="play", aliases=["p"])
-async def play(ctx: commands.Context, *, query: str):
-    """Phát nhạc từ link YouTube hoặc từ khoá tìm kiếm. Vd: !play <link youtube>"""
-    player = await _ensure_voice(ctx)
+# ====================== SLASH COMMANDS ======================
+
+@bot.tree.command(name="play", description="Phát nhạc từ link YouTube hoặc từ khoá tìm kiếm")
+@app_commands.describe(query="Link YouTube hoặc từ khoá tìm kiếm")
+async def play(interaction: discord.Interaction, query: str):
+    await interaction.response.defer()
+    player = await _ensure_voice(interaction)
     if not player:
         return
 
@@ -108,76 +114,76 @@ async def play(ctx: commands.Context, *, query: str):
         tracks = await wavelink.Playable.search(query)
     except Exception as e:
         log.exception(e)
-        return await ctx.send("❌ Có lỗi khi tìm bài hát.")
+        return await interaction.followup.send("❌ Có lỗi khi tìm bài hát.")
 
     if not tracks:
-        return await ctx.send("❌ Không tìm thấy kết quả nào.")
+        return await interaction.followup.send("❌ Không tìm thấy kết quả nào.")
 
     # Nếu là playlist YouTube
     if isinstance(tracks, wavelink.Playlist):
         added = await player.queue.put_wait(tracks)
-        await ctx.send(f"✅ Đã thêm playlist **{tracks.name}** ({added} bài) vào hàng đợi.")
+        await interaction.followup.send(f"✅ Đã thêm playlist **{tracks.name}** ({added} bài) vào hàng đợi.")
     else:
         track = tracks[0]
         await player.queue.put_wait(track)
-        await ctx.send(f"✅ Đã thêm vào hàng đợi: **{track.title}**")
+        await interaction.followup.send(f"✅ Đã thêm vào hàng đợi: **{track.title}**")
 
     if not player.playing:
         next_track = player.queue.get()
         await player.play(next_track)
 
 
-@bot.command(name="skip", aliases=["s"])
-async def skip(ctx: commands.Context):
-    player: wavelink.Player = ctx.voice_client  # type: ignore
+@bot.tree.command(name="skip", description="Bỏ qua bài hát đang phát")
+async def skip(interaction: discord.Interaction):
+    player: wavelink.Player = interaction.guild.voice_client  # type: ignore
     if not player or not player.playing:
-        return await ctx.send("❌ Không có bài nào đang phát.")
+        return await interaction.response.send_message("❌ Không có bài nào đang phát.", ephemeral=True)
     await player.skip(force=True)
-    await ctx.send("⏭️ Đã bỏ qua bài hát.")
+    await interaction.response.send_message("⏭️ Đã bỏ qua bài hát.")
 
 
-@bot.command(name="pause")
-async def pause(ctx: commands.Context):
-    player: wavelink.Player = ctx.voice_client  # type: ignore
+@bot.tree.command(name="pause", description="Tạm dừng phát nhạc")
+async def pause(interaction: discord.Interaction):
+    player: wavelink.Player = interaction.guild.voice_client  # type: ignore
     if not player:
-        return await ctx.send("❌ Bot không ở trong voice channel.")
+        return await interaction.response.send_message("❌ Bot không ở trong voice channel.", ephemeral=True)
     await player.pause(True)
-    await ctx.send("⏸️ Đã tạm dừng.")
+    await interaction.response.send_message("⏸️ Đã tạm dừng.")
 
 
-@bot.command(name="resume")
-async def resume(ctx: commands.Context):
-    player: wavelink.Player = ctx.voice_client  # type: ignore
+@bot.tree.command(name="resume", description="Tiếp tục phát nhạc")
+async def resume(interaction: discord.Interaction):
+    player: wavelink.Player = interaction.guild.voice_client  # type: ignore
     if not player:
-        return await ctx.send("❌ Bot không ở trong voice channel.")
+        return await interaction.response.send_message("❌ Bot không ở trong voice channel.", ephemeral=True)
     await player.pause(False)
-    await ctx.send("▶️ Đã tiếp tục phát.")
+    await interaction.response.send_message("▶️ Đã tiếp tục phát.")
 
 
-@bot.command(name="stop")
-async def stop(ctx: commands.Context):
-    player: wavelink.Player = ctx.voice_client  # type: ignore
+@bot.tree.command(name="stop", description="Dừng phát và xoá hàng đợi")
+async def stop(interaction: discord.Interaction):
+    player: wavelink.Player = interaction.guild.voice_client  # type: ignore
     if not player:
-        return await ctx.send("❌ Bot không ở trong voice channel.")
+        return await interaction.response.send_message("❌ Bot không ở trong voice channel.", ephemeral=True)
     player.queue.clear()
     await player.stop()
-    await ctx.send("⏹️ Đã dừng và xoá hàng đợi.")
+    await interaction.response.send_message("⏹️ Đã dừng và xoá hàng đợi.")
 
 
-@bot.command(name="leave", aliases=["dc", "disconnect"])
-async def leave(ctx: commands.Context):
-    player: wavelink.Player = ctx.voice_client  # type: ignore
+@bot.tree.command(name="leave", description="Rồi voice channel")
+async def leave(interaction: discord.Interaction):
+    player: wavelink.Player = interaction.guild.voice_client  # type: ignore
     if not player:
-        return await ctx.send("❌ Bot không ở trong voice channel.")
+        return await interaction.response.send_message("❌ Bot không ở trong voice channel.", ephemeral=True)
     await player.disconnect()
-    await ctx.send("👋 Đã rời voice channel.")
+    await interaction.response.send_message("👋 Đã rồi voice channel.")
 
 
-@bot.command(name="queue", aliases=["q"])
-async def queue_cmd(ctx: commands.Context):
-    player: wavelink.Player = ctx.voice_client  # type: ignore
+@bot.tree.command(name="queue", description="Xem hàng đợi nhạc")
+async def queue_cmd(interaction: discord.Interaction):
+    player: wavelink.Player = interaction.guild.voice_client  # type: ignore
     if not player or (player.queue.is_empty and not player.playing):
-        return await ctx.send("📭 Hàng đợi trống.")
+        return await interaction.response.send_message("📭 Hàng đợi trống.", ephemeral=True)
 
     lines = []
     if player.current:
@@ -187,26 +193,27 @@ async def queue_cmd(ctx: commands.Context):
     if len(player.queue) > 10:
         lines.append(f"... và {len(player.queue) - 10} bài khác.")
 
-    await ctx.send("\n".join(lines))
+    await interaction.response.send_message("\n".join(lines))
 
 
-@bot.command(name="nowplaying", aliases=["np"])
-async def nowplaying(ctx: commands.Context):
-    player: wavelink.Player = ctx.voice_client  # type: ignore
+@bot.tree.command(name="nowplaying", description="Xem bài hát đang phát")
+async def nowplaying(interaction: discord.Interaction):
+    player: wavelink.Player = interaction.guild.voice_client  # type: ignore
     if not player or not player.current:
-        return await ctx.send("❌ Không có bài nào đang phát.")
+        return await interaction.response.send_message("❌ Không có bài nào đang phát.", ephemeral=True)
     track = player.current
-    await ctx.send(f"🎶 Đang phát: **{track.title}** ({track.author})")
+    await interaction.response.send_message(f"🎶 Đang phát: **{track.title}** ({track.author})")
 
 
-@bot.command(name="volume", aliases=["vol"])
-async def volume(ctx: commands.Context, value: int):
-    player: wavelink.Player = ctx.voice_client  # type: ignore
+@bot.tree.command(name="volume", description="Điều chỉnh âm lượng (0-200)")
+@app_commands.describe(value="Âm lượng từ 0 đến 200")
+async def volume(interaction: discord.Interaction, value: int):
+    player: wavelink.Player = interaction.guild.voice_client  # type: ignore
     if not player:
-        return await ctx.send("❌ Bot không ở trong voice channel.")
+        return await interaction.response.send_message("❌ Bot không ở trong voice channel.", ephemeral=True)
     value = max(0, min(value, 200))
     await player.set_volume(value)
-    await ctx.send(f"🔊 Đã đặt âm lượng: {value}%")
+    await interaction.response.send_message(f"🔊 Đã đặt âm lượng: {value}%")
 
 
 if __name__ == "__main__":
