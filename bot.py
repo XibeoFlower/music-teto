@@ -84,11 +84,11 @@ async def _search_with_timeout(query: str):
             timeout=SEARCH_TIMEOUT
         )
         elapsed = time.time() - start
-        log.info(f"[SEARCH] "{query}" mất {elapsed:.2f}s")
+        log.info(f'[SEARCH] "{query}" mất {elapsed:.2f}s')
         _set_cached(query, tracks)
         return tracks
     except asyncio.TimeoutError:
-        log.warning(f"[TIMEOUT] Search "{query}" quá {SEARCH_TIMEOUT}s")
+        log.warning(f'[TIMEOUT] Search "{query}" quá {SEARCH_TIMEOUT}s')
         return None
     except Exception as e:
         log.exception(f"[SEARCH ERROR] {e}")
