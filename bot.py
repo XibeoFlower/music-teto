@@ -1,6 +1,8 @@
 import os
 import asyncio
 import logging
+import time
+from collections import OrderedDict
 
 import discord
 from discord import app_commands
@@ -9,12 +11,18 @@ import wavelink
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("musicbot")
 
-# ====== Cấu hình từ biến môi trường (đặt trong Railway > Variables) ======
+# ====== Cấu hình ======
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 LAVALINK_HOST = os.environ.get("LAVALINK_HOST", "lavalinkv4.serenetia.com")
 LAVALINK_PORT = int(os.environ.get("LAVALINK_PORT", "443"))
 LAVALINK_PASSWORD = os.environ.get("LAVALINK_PASSWORD", "https://dsc.gg/ajidevserver")
 LAVALINK_SECURE = os.environ.get("LAVALINK_SECURE", "true").lower() == "true"
+SEARCH_TIMEOUT = int(os.environ.get("SEARCH_TIMEOUT", "10"))  # giây
+
+# Cache search: {query_lower: (timestamp, tracks)}
+_search_cache = OrderedDict()
+_CACHE_MAXSIZE = 50
+_CACHE_TTL = 300  # 5 phút
 
 
 class MusicBot(discord.Client):
@@ -32,19 +40,66 @@ class MusicBot(discord.Client):
             password=LAVALINK_PASSWORD,
         )
         await wavelink.Pool.connect(nodes=[node], client=self)
-        # Đồng bộ slash commands (chỉ cần chạy 1 lần, sau đó có thể comment dòng này)
         await self.tree.sync()
-        log.info("Đã đồng bộ slash commands với Discord.")
+        log.info("Đã đồng bộ slash commands.")
 
 
 bot = MusicBot()
 
 
-# ====================== SỰ KIỆN WAVELINK ======================
+# ====================== CACHE & HELPER ======================
+
+def _get_cached(query: str):
+    now = time.time()
+    key = query.lower().strip()
+    if key in _search_cache:
+        ts, tracks = _search_cache[key]
+        if now - ts < _CACHE_TTL:
+            _search_cache.move_to_end(key)
+            return tracks
+        else:
+            del _search_cache[key]
+    return None
+
+
+def _set_cached(query: str, tracks):
+    key = query.lower().strip()
+    _search_cache[key] = (time.time(), tracks)
+    _search_cache.move_to_end(key)
+    while len(_search_cache) > _CACHE_MAXSIZE:
+        _search_cache.popitem(last=False)
+
+
+async def _search_with_timeout(query: str):
+    """Search có timeout để tránh treo"""
+    cached = _get_cached(query)
+    if cached is not None:
+        log.info(f"[CACHE HIT] {query}")
+        return cached
+
+    start = time.time()
+    try:
+        tracks = await asyncio.wait_for(
+            wavelink.Playable.search(query),
+            timeout=SEARCH_TIMEOUT
+        )
+        elapsed = time.time() - start
+        log.info(f"[SEARCH] "{query}" mất {elapsed:.2f}s")
+        _set_cached(query, tracks)
+        return tracks
+    except asyncio.TimeoutError:
+        log.warning(f"[TIMEOUT] Search "{query}" quá {SEARCH_TIMEOUT}s")
+        return None
+    except Exception as e:
+        log.exception(f"[SEARCH ERROR] {e}")
+        return None
+
+
+# ====================== SỰ KIỆN ======================
 
 @bot.event
 async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
-    log.info(f"Node '{payload.node.identifier}' đã sẵn sàng (resumed={payload.resumed}).")
+    log.info(f"Node '{payload.node.identifier}' đã sẵn sàng.")
 
 
 @bot.event
@@ -55,7 +110,13 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
 
     if not player.queue.is_empty:
         next_track = player.queue.get()
+        # Prefetch: resolve track trước khi play (nếu cần)
         await player.play(next_track)
+
+        # Prefetch bài tiếp theo nữa (nếu có) để giảm delay
+        if not player.queue.is_empty:
+            upcoming = player.queue[0]
+            log.info(f"[PREFETCH] Chuẩn bị sẵn: {upcoming.title}")
     else:
         channel = getattr(player, "home", None)
         if channel:
@@ -64,7 +125,6 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before, after):
-    # Tự rồi voice channel nếu bot ở một mình
     if member.bot:
         return
     vc = member.guild.voice_client
@@ -77,14 +137,14 @@ async def on_voice_state_update(member: discord.Member, before, after):
 
 @bot.event
 async def on_ready():
-    log.info(f"Đăng nhập với tên {bot.user} (ID: {bot.user.id})")
+    log.info(f"Đăng nhập: {bot.user} (ID: {bot.user.id})")
 
 
-# ====================== HÀM HỖ TRỢ ======================
+# ====================== VOICE HELPER ======================
 
 async def _ensure_voice(interaction: discord.Interaction) -> wavelink.Player | None:
     if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.response.send_message("❌ Bạn cần vào một voice channel trước.", ephemeral=True)
+        await interaction.response.send_message("❌ Bạn cần vào voice channel trước.", ephemeral=True)
         return None
 
     player: wavelink.Player = interaction.guild.voice_client  # type: ignore
@@ -92,7 +152,7 @@ async def _ensure_voice(interaction: discord.Interaction) -> wavelink.Player | N
         try:
             player = await interaction.user.voice.channel.connect(cls=wavelink.Player)
         except discord.ClientException:
-            await interaction.response.send_message("❌ Không thể kết nối vào voice channel.", ephemeral=True)
+            await interaction.response.send_message("❌ Không thể kết nối voice channel.", ephemeral=True)
             return None
         player.home = interaction.channel  # type: ignore
         player.autoplay = wavelink.AutoPlayMode.partial
@@ -105,32 +165,33 @@ async def _ensure_voice(interaction: discord.Interaction) -> wavelink.Player | N
 @bot.tree.command(name="play", description="Phát nhạc từ link YouTube hoặc từ khoá tìm kiếm")
 @app_commands.describe(query="Link YouTube hoặc từ khoá tìm kiếm")
 async def play(interaction: discord.Interaction, query: str):
+    start_total = time.time()
     await interaction.response.defer()
+
     player = await _ensure_voice(interaction)
     if not player:
         return
 
-    try:
-        tracks = await wavelink.Playable.search(query)
-    except Exception as e:
-        log.exception(e)
-        return await interaction.followup.send("❌ Có lỗi khi tìm bài hát.")
-
+    tracks = await _search_with_timeout(query)
+    if tracks is None:
+        return await interaction.followup.send("⏱️ Tìm nhạc quá lâu, Lavalink node có thể bị lag. Thử lại sau hoặc đổi node.")
     if not tracks:
-        return await interaction.followup.send("❌ Không tìm thấy kết quả nào.")
+        return await interaction.followup.send("❌ Không tìm thấy kết quả.")
 
-    # Nếu là playlist YouTube
     if isinstance(tracks, wavelink.Playlist):
         added = await player.queue.put_wait(tracks)
         await interaction.followup.send(f"✅ Đã thêm playlist **{tracks.name}** ({added} bài) vào hàng đợi.")
     else:
         track = tracks[0]
         await player.queue.put_wait(track)
-        await interaction.followup.send(f"✅ Đã thêm vào hàng đợi: **{track.title}**")
+        await interaction.followup.send(f"✅ Đã thêm: **{track.title}**")
 
     if not player.playing:
         next_track = player.queue.get()
         await player.play(next_track)
+
+    total = time.time() - start_total
+    log.info(f"[PLAY] Tổng thờ gian xử lý /play: {total:.2f}s")
 
 
 @bot.tree.command(name="skip", description="Bỏ qua bài hát đang phát")
