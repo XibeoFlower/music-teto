@@ -14,10 +14,10 @@ log = logging.getLogger("musicbot")
 # ====== Cấu hình ======
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 
-# Node chính: Singapore (gần VN nhất)
-LAVALINK_HOST = os.environ.get("LAVALINK_HOST", "lava1.horizxon.studio")
-LAVALINK_PORT = int(os.environ.get("LAVALINK_PORT", "80"))
-LAVALINK_PASSWORD = os.environ.get("LAVALINK_PASSWORD", "horizxon.studio")
+# Node chính: Indonesia (gần VN nhất, v4)
+LAVALINK_HOST = os.environ.get("LAVALINK_HOST", "lava.catfein.com")
+LAVALINK_PORT = int(os.environ.get("LAVALINK_PORT", "4000"))
+LAVALINK_PASSWORD = os.environ.get("LAVALINK_PASSWORD", "catfein")
 LAVALINK_SECURE = os.environ.get("LAVALINK_SECURE", "false").lower() == "true"
 
 SEARCH_TIMEOUT = int(os.environ.get("SEARCH_TIMEOUT", "10"))
@@ -37,17 +37,31 @@ class MusicBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
+        # Thử kết nối node chính
         scheme = "https" if LAVALINK_SECURE else "http"
-        node = wavelink.Node(
-            uri=f"{scheme}://{LAVALINK_HOST}:{LAVALINK_PORT}",
-            password=LAVALINK_PASSWORD,
-        )
+        nodes = [
+            wavelink.Node(
+                uri=f"{scheme}://{LAVALINK_HOST}:{LAVALINK_PORT}",
+                password=LAVALINK_PASSWORD,
+            )
+        ]
+
+        # Backup nodes (tự động thử nếu node chính fail)
+        backup_nodes = [
+            ("https://v4.lavalink.rocks:443", "horizxon.tech"),   # Singapore SSL
+            ("http://free-lava.heavencloud.in:4000", "heavencloud.in"),  # Global
+            ("http://n2.meww.me:2555", "meww.me"),  # Global
+            ("http://node.lewdhutao.my.eu.org:80", "youshallnotpass"),  # Global
+        ]
+
+        for uri, pwd in backup_nodes:
+            nodes.append(wavelink.Node(uri=uri, password=pwd))
+
         try:
-            await wavelink.Pool.connect(nodes=[node], client=self)
+            await wavelink.Pool.connect(nodes=nodes, client=self)
             log.info(f"✅ Đã kết nối Lavalink node: {LAVALINK_HOST}:{LAVALINK_PORT}")
         except Exception as e:
-            log.error(f"❌ Không kết nối được Lavalink node: {e}")
-            log.error("Vui lòng kiểm tra LAVALINK_HOST trong Railway Variables.")
+            log.error(f"❌ Không kết nối được Lavalink: {e}")
 
         await self.tree.sync()
         log.info("Đã đồng bộ slash commands.")
