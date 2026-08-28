@@ -13,16 +13,19 @@ log = logging.getLogger("musicbot")
 
 # ====== Cấu hình ======
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-LAVALINK_HOST = os.environ.get("LAVALINK_HOST", "lavalinkv4.serenetia.com")
-LAVALINK_PORT = int(os.environ.get("LAVALINK_PORT", "443"))
-LAVALINK_PASSWORD = os.environ.get("LAVALINK_PASSWORD", "https://dsc.gg/ajidevserver")
-LAVALINK_SECURE = os.environ.get("LAVALINK_SECURE", "true").lower() == "true"
-SEARCH_TIMEOUT = int(os.environ.get("SEARCH_TIMEOUT", "10"))  # giây
 
-# Cache search: {query_lower: (timestamp, tracks)}
+# Node chính: Singapore (gần VN nhất)
+LAVALINK_HOST = os.environ.get("LAVALINK_HOST", "lava1.horizxon.studio")
+LAVALINK_PORT = int(os.environ.get("LAVALINK_PORT", "80"))
+LAVALINK_PASSWORD = os.environ.get("LAVALINK_PASSWORD", "horizxon.studio")
+LAVALINK_SECURE = os.environ.get("LAVALINK_SECURE", "false").lower() == "true"
+
+SEARCH_TIMEOUT = int(os.environ.get("SEARCH_TIMEOUT", "10"))
+
+# Cache search
 _search_cache = OrderedDict()
 _CACHE_MAXSIZE = 50
-_CACHE_TTL = 300  # 5 phút
+_CACHE_TTL = 300
 
 
 class MusicBot(discord.Client):
@@ -39,7 +42,13 @@ class MusicBot(discord.Client):
             uri=f"{scheme}://{LAVALINK_HOST}:{LAVALINK_PORT}",
             password=LAVALINK_PASSWORD,
         )
-        await wavelink.Pool.connect(nodes=[node], client=self)
+        try:
+            await wavelink.Pool.connect(nodes=[node], client=self)
+            log.info(f"✅ Đã kết nối Lavalink node: {LAVALINK_HOST}:{LAVALINK_PORT}")
+        except Exception as e:
+            log.error(f"❌ Không kết nối được Lavalink node: {e}")
+            log.error("Vui lòng kiểm tra LAVALINK_HOST trong Railway Variables.")
+
         await self.tree.sync()
         log.info("Đã đồng bộ slash commands.")
 
@@ -71,7 +80,6 @@ def _set_cached(query: str, tracks):
 
 
 async def _search_with_timeout(query: str):
-    """Search có timeout để tránh treo"""
     cached = _get_cached(query)
     if cached is not None:
         log.info(f"[CACHE HIT] {query}")
@@ -110,10 +118,7 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
 
     if not player.queue.is_empty:
         next_track = player.queue.get()
-        # Prefetch: resolve track trước khi play (nếu cần)
         await player.play(next_track)
-
-        # Prefetch bài tiếp theo nữa (nếu có) để giảm delay
         if not player.queue.is_empty:
             upcoming = player.queue[0]
             log.info(f"[PREFETCH] Chuẩn bị sẵn: {upcoming.title}")
